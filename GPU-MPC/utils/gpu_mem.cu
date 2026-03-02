@@ -24,6 +24,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 #include "helper_cuda.h"
 #include "gpu_stats.h"
 #include <cassert>
@@ -46,10 +47,34 @@ extern "C" void initGPUMemPool()
     checkCudaErrors(cudaDeviceGetDefaultMemPool(&mempool, device));
     uint64_t threshold = UINT64_MAX;
     checkCudaErrors(cudaMemPoolSetAttribute(mempool, cudaMemPoolAttrReleaseThreshold, &threshold));
-    uint64_t *d_dummy_ptr;
-    uint64_t bytes = 40 * (1ULL << 30);
-    checkCudaErrors(cudaMallocAsync(&d_dummy_ptr, bytes, 0));
-    checkCudaErrors(cudaFreeAsync(d_dummy_ptr, 0));
+
+    uint64_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+    checkCudaErrors(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+    uint64_t requested_bytes = 40ULL * (1ULL << 30);
+    const char *warmup_gb_env = std::getenv("GPU_MEMPOOL_WARMUP_GB");
+    if (warmup_gb_env != nullptr)
+    {
+        uint64_t warmup_gb = strtoull(warmup_gb_env, nullptr, 10);
+        requested_bytes = warmup_gb * (1ULL << 30);
+    }
+
+    // Reserve at most 80% of currently free memory to avoid OOM.
+    uint64_t bytes = std::min(requested_bytes, (free_bytes * 8) / 10);
+    uint64_t *d_dummy_ptr = nullptr;
+    while (bytes >= (1ULL << 28))
+    {
+        cudaError_t err = cudaMallocAsync(&d_dummy_ptr, bytes, 0);
+        if (err == cudaSuccess)
+        {
+            checkCudaErrors(cudaFreeAsync(d_dummy_ptr, 0));
+            break;
+        }
+        cudaGetLastError();
+        bytes /= 2;
+    }
+
     uint64_t reserved_read, threshold_read;
     checkCudaErrors(cudaMemPoolGetAttribute(mempool, cudaMemPoolAttrReservedMemCurrent, &reserved_read));
     checkCudaErrors(cudaMemPoolGetAttribute(mempool, cudaMemPoolAttrReleaseThreshold, &threshold_read));
